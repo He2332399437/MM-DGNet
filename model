@@ -1,0 +1,128 @@
+from scipy.io import loadmat
+import os
+import numpy as np
+import torch
+import random
+import torch.nn as nn
+import torch.optim as optim
+from scipy import signal
+import pywt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import warnings
+from torch.utils.data import Dataset, DataLoader
+import seaborn as sns
+import torch.nn.functional as F
+from scipy.signal import resample, hilbert
+import copy
+from sklearn.manifold import TSNE
+from mpl_toolkits.mplot3d import Axes3D
+warnings.filterwarnings('ignore')
+
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, in_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden_dim, in_dim)
+        self.norm = nn.LayerNorm(in_dim)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x):
+        residual = x
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return self.norm(x + residual)
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha=1.0):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class MultiModalMLPTransformer(nn.Module):
+    def __init__(self, num_classes=4, num_domains=4,
+                 d_model=128, nhead=4, num_layers_tf=2,
+                 dim_feedforward=256, use_dann=True,
+                 dropout=0.6, dim_time=18, dim_freq=3072, dim_env=15):
+        super(MultiModalMLPTransformer, self).__init__()
+        self.use_dann = use_dann
+        self.d_model = d_model
+        self.epoch = 0
+        self.branch_time = self.create_branch(dim_time, dropout)
+        self.branch_freq = self.create_branch(dim_freq, dropout)
+        self.branch_env = self.create_branch(dim_env, dropout)
+        self.kv_proj = nn.Linear(64, d_model)
+        self.query_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers_tf)
+        self.dropout = nn.Dropout(dropout)
+        self.head_cls = nn.utils.spectral_norm(nn.Linear(d_model, num_classes))
+        if use_dann:
+            self.domain_classifier = nn.Sequential(
+                nn.Linear(d_model, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.4),
+                nn.Linear(128, num_domains))
+        self.domain_prompt = AdaptiveDomainPrompt_KG(
+            num_domains=num_domains,
+            prompt_dim=d_model,
+            hidden_dim=dim_feedforward)
+    def create_branch(self, input_dim, dropout):
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            ResidualMLPBlock(64, 64) )
+    def forward(self, time_data, time_features, freq_data, wavelet_data,
+                domain_id=None, labels=None, alpha=1.0):
+        if time_features.dim() == 3:
+            time_features = time_features.mean(dim=-1)
+        if freq_data.dim() == 3:
+            freq_data = freq_data.view(freq_data.size(0), -1)
+        if wavelet_data.dim() == 3:
+            wavelet_data = wavelet_data.mean(dim=-1)
+        t = self.branch_time(time_features)
+        f = self.branch_freq(freq_data)
+        w = self.branch_env(wavelet_data)
+        concat_feat = torch.stack([t, f, w], dim=1)
+        concat_feat = self.kv_proj(concat_feat)
+        query = self.query_token.expand(concat_feat.size(0), -1, -1)
+        attn_out, _ = self.cross_attn(query, concat_feat, concat_feat)
+        attn_out = F.layer_norm(attn_out, attn_out.shape[-1:])
+        z = attn_out.squeeze(1)
+        z_all = self.encoder(z.unsqueeze(1)).squeeze(1)
+        if self.training:
+            z_all = self.dropout(z_all)
+        loss_align = torch.tensor(0.0, device=z_all.device)
+        if domain_id is not None:
+            prompt, loss_align = self.domain_prompt(domain_id, feat_mean=z_all, return_loss=True)
+            prompt_strength = max(0.08, 0.20 - 0.012 * self.epoch)
+            z_all = z_all + prompt_strength * prompt
+        else:
+            prompt = self.domain_prompt(torch.zeros(z_all.size(0), dtype=torch.long, device=z_all.device),
+                                        feat_mean=z_all)
+            z_all = z_all + 0.05 * prompt
+
+        logits = self.head_cls(z_all)
+
+        dom_logits = None
+        if self.use_dann and domain_id is not None:
+            rev_feat = GradReverse.apply(z_all, alpha)
+            dom_logits = self.domain_classifier(rev_feat)
+
+        return logits, dom_logits, loss_align
