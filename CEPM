@@ -1,0 +1,178 @@
+from scipy.io import loadmat
+import os
+import numpy as np
+import torch
+import random
+import torch.nn as nn
+import torch.optim as optim
+from scipy import signal
+import pywt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import warnings
+from torch.utils.data import Dataset, DataLoader
+import seaborn as sns
+import torch.nn.functional as F
+from scipy.signal import resample, hilbert
+import copy
+from sklearn.manifold import TSNE
+from mpl_toolkits.mplot3d import Axes3D
+warnings.filterwarnings('ignore')
+
+def mix_features_to_target(feat_s1, feat_s2, lam, noise_std=0.05):
+    mix = {}
+    for k in feat_s1.keys():
+        v1 = np.array(feat_s1[k], dtype=np.float32)
+        v2 = np.array(feat_s2[k], dtype=np.float32)
+
+        m1, s1 = v1.mean(), v1.std() + 1e-6
+        m2, s2 = v2.mean(), v2.std() + 1e-6
+        align_factor = np.random.uniform(0.4, 0.7)
+
+        v1n = (v1 - m1 * align_factor) / s1
+        v2n = (v2 - m2 * align_factor) / s2
+
+        v_mix = lam * v1n + (1 - lam) * v2n
+
+        drop_mask = np.random.binomial(1, 0.90, size=v_mix.shape)
+        v_mix = v_mix * drop_mask
+
+        noise = np.random.normal(0, noise_std, size=v_mix.shape)
+        v_mix = v_mix + noise
+
+        scale_mix = lam * s1 + (1 - lam) * s2
+        center_mix = lam * m1 + (1 - lam) * m2
+        mix[k] = (v_mix * scale_mix + center_mix * align_factor).tolist()
+
+    return mix
+def generate_pseudo_domain_samples(train_data, n_mix_per_class=120, alpha=0.4):
+    mixed_samples = []
+    class_to_samples = {}
+
+    for item in train_data:
+        class_to_samples.setdefault(item["y"], []).append(item)
+
+    class_difficulty = {}
+    class_sample_counts = {}
+
+    for cls, items in class_to_samples.items():
+        domains = set(item["domain"] for item in items)
+        freq_features = np.array([item["feat"]["freq"] for item in items])
+
+        sample_sparse = 1.0 / np.sqrt(len(items) + 1)
+        domain_diverse = 1.0 / (len(domains) + 1)
+        intra_var = np.var(freq_features, axis=0).mean()
+        inter_var = np.var([np.mean(item["feat"]["freq"]) for item in items])
+
+        difficulty = (0.3 * sample_sparse + 0.3 * domain_diverse +
+                      0.2 * intra_var + 0.2 * inter_var)
+        class_difficulty[cls] = difficulty
+        class_sample_counts[cls] = len(items)
+
+    max_diff = max(class_difficulty.values()) + 1e-8
+    class_difficulty = {k: v / max_diff for k, v in class_difficulty.items()}
+
+    print(f"   📊 类别样本数: {class_sample_counts}")
+
+    for cls, items in class_to_samples.items():
+        domain_groups = {}
+        for it in items:
+            domain_groups.setdefault(it["domain"], []).append(it)
+
+        domain_list = list(domain_groups.keys())
+        if len(domain_list) < 2:
+            continue
+
+        difficulty_factor = class_difficulty[cls]
+        sparse_factor = 1.0 / np.sqrt(len(items) / 1000 + 1)
+        n_samples = int(n_mix_per_class * (0.5 + difficulty_factor + sparse_factor))
+
+        print(f"   类{cls}: 生成{n_samples}个伪样本")
+
+        domain_distances = {}
+        for d1 in domain_list:
+            for d2 in domain_list:
+                if d1 >= d2:
+                    continue
+                feat1 = np.mean([item["feat"]["freq"] for item in domain_groups[d1]], axis=0)
+                feat2 = np.mean([item["feat"]["freq"] for item in domain_groups[d2]], axis=0)
+                dist = np.linalg.norm(feat1 - feat2)
+                domain_distances[(d1, d2)] = dist
+
+        if domain_distances:
+            total_dist = sum(domain_distances.values())
+            pair_probs = np.array([v / total_dist for v in domain_distances.values()])
+            pair_list = list(domain_distances.keys())
+
+        for i in range(n_samples):
+            lam = np.random.beta(alpha, alpha)
+            lam = np.clip(lam, 0.3, 0.7)
+
+            if domain_distances:
+                d1, d2 = pair_list[np.random.choice(len(pair_list), p=pair_probs)]
+            else:
+                d1, d2 = np.random.choice(domain_list, 2, replace=False)
+
+            s1 = np.random.choice(domain_groups[d1])
+            s2 = np.random.choice(domain_groups[d2])
+
+            mixed_feat = mix_features_to_target(s1["feat"], s2["feat"], lam)
+
+            mixed_samples.append({
+                "y": cls,
+                "domain": 3,  # ✅ 伪域ID=3
+                "feat": mixed_feat
+            })
+
+    print(f"✅ 共生成 {len(mixed_samples)} 条伪域样本")
+    return mixed_samples
+
+class AdaptiveDomainPrompt_KG(nn.Module):
+    def __init__(self, num_domains, prompt_dim=128, hidden_dim=256,
+                 dropout=0.5, alpha_align=0.05):
+        super().__init__()
+        self.num_domains = num_domains
+        self.alpha_align = alpha_align  
+        self.prompt_dim = prompt_dim
+        self.domain_embed = nn.Parameter(torch.randn(num_domains, prompt_dim) * 0.01)
+        nn.init.orthogonal_(self.domain_embed)
+        self.domain_proj = nn.Sequential(
+            nn.Linear(1, prompt_dim),
+            nn.LayerNorm(prompt_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        self.feat_adapter = nn.Sequential(
+            nn.Linear(prompt_dim, prompt_dim),
+            nn.LayerNorm(prompt_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        self.norm = nn.LayerNorm(prompt_dim)
+
+    def forward(self, domain_ids, feat_mean=None, return_loss=False):
+        dom_norm = domain_ids.float().unsqueeze(1) / (self.num_domains - 1)
+        safe_ids = domain_ids.clamp(max=self.num_domains - 1)
+
+        base_prompt = self.domain_embed[safe_ids]
+        cont_prompt = self.domain_proj(dom_norm)
+
+        if feat_mean is not None:
+            adapt_prompt = self.feat_adapter(feat_mean)
+            prompt = base_prompt + cont_prompt + adapt_prompt
+        else:
+            prompt = base_prompt + cont_prompt
+
+        prompt = self.norm(prompt)
+
+        loss_total = torch.tensor(0.0, device=prompt.device)
+        if return_loss and self.training:
+            global_center = self.domain_embed.mean(0, keepdim=True)
+            loss_align = self.alpha_align * ((self.domain_embed - global_center) ** 2).mean()
+            loss_total = loss_align
+
+        return (prompt, loss_total) if return_loss else prompt
