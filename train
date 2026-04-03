@@ -1,80 +1,91 @@
-import copy
 import numpy as np
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
+import copy
 from tqdm import tqdm
+from model import FocalLoss
+import warnings
+warnings.filterwarnings('ignore')
 
-from model import CSHG, FocalLoss
-from test  import evaluate_model
 
-
-def train_model(
-    model: CSHG,
-    train_loader,
-    val_loader,
-    unseen_loader=None,
-    num_epochs: int = 40,
-    device: str = "cuda",
-) -> float:
+def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=40, device='cuda'):
 
     class_counts = torch.zeros(4)
     for batch in train_loader:
-        for lbl in batch["label"]:
-            class_counts[lbl] += 1
+        labels = batch['label']
+        for l in labels:
+            class_counts[l] += 1
+
     class_weights = 1.0 / (class_counts + 1)
-    class_weights = (class_weights / class_weights.sum() * 4).to(device)
-    print(f"  📊 类别权重: {class_weights.cpu().numpy()}")
+    class_weights = class_weights / class_weights.sum() * 4
+    class_weights = class_weights.to(device)
+
+    print(f" 📊  {class_weights.cpu().numpy()}")
 
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)
 
     optimizer = optim.AdamW([
-        {"params": model.branch_time.parameters(),   "lr": 2e-4, "weight_decay": 8e-3},
-        {"params": model.branch_freq.parameters(),   "lr": 2e-4, "weight_decay": 8e-3},
-        {"params": model.branch_env.parameters(),    "lr": 2e-4, "weight_decay": 8e-3},
-        {"params": model.encoder.parameters(),       "lr": 2e-4, "weight_decay": 8e-3},
-        {"params": model.head_cls.parameters(),      "lr": 5e-4, "weight_decay": 3e-3},
-        {"params": model.domain_prompt.parameters(), "lr": 3e-4, "weight_decay": 5e-3},
+        {'params': model.branch_time.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
+        {'params': model.branch_freq.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
+        {'params': model.branch_env.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
+        {'params': model.encoder.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
+        {'params': model.head_cls.parameters(), 'lr': 5e-4, 'weight_decay': 3e-3},
+        {'params': model.domain_prompt.parameters(), 'lr': 3e-4, 'weight_decay': 5e-3}
     ])
 
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=8, T_mult=2, eta_min=1e-6)
+        optimizer, T_0=8, T_mult=2, eta_min=1e-6
+    )
+
+    swa_model = optim.swa_utils.AveragedModel(model)
+    swa_start = max(5, num_epochs // 3)
+    swa_scheduler = optim.swa_utils.SWALR(optimizer, swa_lr=5e-5)
+
+    best_unseen_acc = 0.0
+    best_unseen_weights = None
+    best_gap = float('inf')
+
+    patience = 10
+    patience_counter = 0
+    min_delta = 0.2
 
     lambda_domain_init = 0.5
-    lambda_prompt      = 0.08
-    patience           = 10
-    min_delta          = 0.2
-
-    best_unseen_acc     = 0.0
-    best_unseen_weights = None
-    patience_counter    = 0
-    val_acc             = 0.0
+    lambda_prompt = 0.08
 
     for epoch in range(num_epochs):
         model.epoch = epoch
         model.train()
-        train_correct = train_total = 0
 
-        alpha_dann    = min(2.0 / (1 + np.exp(-15 * epoch / num_epochs)) - 1, 0.8)
+        train_loss, train_correct, train_total = 0.0, 0, 0
+
+        alpha_dann = min(2.0 / (1 + np.exp(-15 * epoch / num_epochs)) - 1, 0.8)
         lambda_domain = lambda_domain_init * alpha_dann
 
-        for batch in tqdm(train_loader,
-                          desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False):
-            time_data     = batch["time_data"].to(device)
-            time_features = batch["time_features"].to(device)
-            freq_data     = batch["freq_data"].to(device)
-            wavelet_data  = batch["wavelet_data"].to(device)
-            labels        = batch["label"].to(device)
-            domain_id     = batch["domain"].to(device)
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False):
+            time_data = batch['time_data'].to(device)
+            time_features = batch['time_features'].to(device)
+            freq_data = batch['freq_data'].to(device)
+            wavelet_data = batch['wavelet_data'].to(device)
+            labels = batch['label'].to(device)
+            domain_id = batch.get('domain', None)
+            if domain_id is not None:
+                domain_id = domain_id.to(device)
 
             optimizer.zero_grad()
+
             outputs, dom_logits, loss_align = model(
                 time_data, time_features, freq_data, wavelet_data,
-                domain_id=domain_id, labels=labels, alpha=alpha_dann)
+                domain_id=domain_id, labels=labels, alpha=alpha_dann
+            )
 
-            class_loss  = criterion(outputs, labels)
-            domain_loss = (F.cross_entropy(dom_logits, domain_id)
-                           if dom_logits is not None else torch.tensor(0.0, device=device))
+            class_loss = criterion(outputs, labels)
+
+            if dom_logits is not None and domain_id is not None:
+                domain_loss = F.cross_entropy(dom_logits, domain_id)
+            else:
+                domain_loss = torch.tensor(0.0, device=device)
+
             loss = class_loss + lambda_domain * domain_loss + lambda_prompt * loss_align
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -84,52 +95,88 @@ def train_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            _, predicted   = outputs.max(1)
-            train_total   += labels.size(0)
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_total += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
 
         scheduler.step()
-        train_acc = 100.0 * train_correct / max(train_total, 1)
+
+        train_loss /= len(train_loader)
+        train_acc = 100. * train_correct / train_total
 
         model.eval()
-        val_correct = val_total = 0
+        val_loss, val_correct, val_total = 0.0, 0, 0
         with torch.no_grad():
             for batch in val_loader:
-                outputs, _, _ = model(
-                    batch["time_data"].to(device),
-                    batch["time_features"].to(device),
-                    batch["freq_data"].to(device),
-                    batch["wavelet_data"].to(device))
-                _, predicted  = outputs.max(1)
-                val_total    += batch["label"].size(0)
-                val_correct  += predicted.eq(batch["label"].to(device)).sum().item()
-        val_acc = 100.0 * val_correct / max(val_total, 1)
+                time_data = batch['time_data'].to(device)
+                time_features = batch['time_features'].to(device)
+                freq_data = batch['freq_data'].to(device)
+                wavelet_data = batch['wavelet_data'].to(device)
+                labels = batch['label'].to(device)
+
+                outputs, _, _ = model(time_data, time_features, freq_data, wavelet_data)
+                loss = criterion(outputs, labels)
+
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+
+        val_loss /= len(val_loader)
+        val_acc = 100. * val_correct / val_total
 
         unseen_acc = 0.0
         if unseen_loader is not None:
             unseen_acc, _, _ = evaluate_model(model, unseen_loader, device)
 
-        print(f"Epoch {epoch + 1:02d} | "
-              f"Train: {train_acc:.2f}% | "
-              f"Val: {val_acc:.2f}% | "
-              f"Unseen: {unseen_acc:.2f}%")
+        gap = abs(val_acc - unseen_acc)
+
+        print(f'Epoch {epoch + 1:02d} | Train: {train_acc:.2f}% | '
+              f'Val: {val_acc:.2f}% | Unseen: {unseen_acc:.2f}% | '
+              f'Gap: {gap:.2f}%')
 
         if unseen_acc > best_unseen_acc + min_delta:
-            best_unseen_acc     = unseen_acc
+            best_unseen_acc = unseen_acc
             best_unseen_weights = copy.deepcopy(model.state_dict())
-            print(f"  ✅ 新最佳 Unseen: {best_unseen_acc:.2f}%")
+            print(f" ✅ 新最佳 Unseen: {best_unseen_acc:.2f}%")
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n⚠️  早停触发 (连续 {patience} 轮无改进)")
+                print(f"\n⚠️ 早停触发(连续{patience}轮无改进)")
                 break
 
     if unseen_loader is not None:
         if best_unseen_weights is not None:
-            print(f"\n✅ 加载最佳 Unseen 模型 (Acc={best_unseen_acc:.2f}%)")
+            print(f"\n✅ best Unseen  (Acc={best_unseen_acc:.2f}%)")
             model.load_state_dict(best_unseen_weights)
         return best_unseen_acc
+
     else:
-        print(f"\n✅ 域内任务返回验证集准确率 {val_acc:.2f}%")
+        print(f"\n✅ ACC {val_acc:.2f}%")
         return val_acc
+
+
+def evaluate_model(model, test_loader, device='cuda'):
+    model.eval()
+
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            time_data = batch['time_data'].to(device)
+            time_features = batch['time_features'].to(device)
+            freq_data = batch['freq_data'].to(device)
+            wavelet_data = batch['wavelet_data'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs, _, _ = model(time_data, time_features, freq_data, wavelet_data)
+            _, predicted = outputs.max(1)
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    acc = 100. * np.sum(np.array(all_preds) == np.array(all_labels)) / len(all_labels)
+
+    return acc, all_preds, all_labels
