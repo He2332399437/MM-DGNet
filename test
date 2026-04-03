@@ -1,1 +1,51 @@
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
 
+LABEL_NAMES = ["A1", "A2", "A3", "Normal"]
+
+
+def evaluate_model(model, test_loader, device: str = "cuda"):
+   
+    model.eval()
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            outputs, _, _ = model(
+                batch["time_data"].to(device),
+                batch["time_features"].to(device),
+                batch["freq_data"].to(device),
+                batch["wavelet_data"].to(device),
+            )
+            _, predicted = outputs.max(1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch["label"].numpy())
+
+    acc = 100.0 * np.sum(np.array(all_preds) == np.array(all_labels)) / len(all_labels)
+    return acc, all_preds, all_labels
+
+
+def print_report(y_true, y_pred, label_names=None):
+    names = label_names if label_names is not None else LABEL_NAMES
+    print("\n分类报告:")
+    print(classification_report(y_true, y_pred, target_names=names, zero_division=0))
+
+
+def plot_confusion_matrix(y_true, y_pred, title: str,
+                          save_path: str, label_names=None):
+    names = label_names if label_names is not None else LABEL_NAMES
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=names, yticklabels=names)
+    plt.title(title, fontsize=12)
+    plt.ylabel("True Label",      fontsize=11)
+    plt.xlabel("Predicted Label", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  📊 混淆矩阵已保存: {save_path}")
