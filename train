@@ -1,119 +1,80 @@
-from scipy.io import loadmat
-import os
+import copy
 import numpy as np
 import torch
-import random
-import torch.nn as nn
 import torch.optim as optim
-from scipy import signal
-import pywt
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import warnings
-from torch.utils.data import Dataset, DataLoader
-import seaborn as sns
 import torch.nn.functional as F
-from scipy.signal import resample, hilbert
-import copy
-from sklearn.manifold import TSNE
-from mpl_toolkits.mplot3d import Axes3D
-warnings.filterwarnings('ignore')
+from tqdm import tqdm
 
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
+from model import CSHG, FocalLoss
+from test  import evaluate_model
 
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        else:
-            return focal_loss
-def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=40, device='cuda'):
+
+def train_model(
+    model: CSHG,
+    train_loader,
+    val_loader,
+    unseen_loader=None,
+    num_epochs: int = 40,
+    device: str = "cuda",
+) -> float:
 
     class_counts = torch.zeros(4)
     for batch in train_loader:
-        labels = batch['label']
-        for l in labels:
-            class_counts[l] += 1
-
+        for lbl in batch["label"]:
+            class_counts[lbl] += 1
     class_weights = 1.0 / (class_counts + 1)
-    class_weights = class_weights / class_weights.sum() * 4
-    class_weights = class_weights.to(device)
-
-    print(f" 📊 类别权重: {class_weights.cpu().numpy()}")
+    class_weights = (class_weights / class_weights.sum() * 4).to(device)
+    print(f"  📊 类别权重: {class_weights.cpu().numpy()}")
 
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)
 
     optimizer = optim.AdamW([
-        {'params': model.branch_time.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
-        {'params': model.branch_freq.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
-        {'params': model.branch_env.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
-        {'params': model.encoder.parameters(), 'lr': 2e-4, 'weight_decay': 8e-3},
-        {'params': model.head_cls.parameters(), 'lr': 5e-4, 'weight_decay': 3e-3},
-        {'params': model.domain_prompt.parameters(), 'lr': 3e-4, 'weight_decay': 5e-3}
+        {"params": model.branch_time.parameters(),   "lr": 2e-4, "weight_decay": 8e-3},
+        {"params": model.branch_freq.parameters(),   "lr": 2e-4, "weight_decay": 8e-3},
+        {"params": model.branch_env.parameters(),    "lr": 2e-4, "weight_decay": 8e-3},
+        {"params": model.encoder.parameters(),       "lr": 2e-4, "weight_decay": 8e-3},
+        {"params": model.head_cls.parameters(),      "lr": 5e-4, "weight_decay": 3e-3},
+        {"params": model.domain_prompt.parameters(), "lr": 3e-4, "weight_decay": 5e-3},
     ])
 
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=8, T_mult=2, eta_min=1e-6
-    )
-
-    swa_model = optim.swa_utils.AveragedModel(model)
-    swa_start = max(5, num_epochs // 3)
-    swa_scheduler = optim.swa_utils.SWALR(optimizer, swa_lr=5e-5)
-
-    best_unseen_acc = 0.0
-    best_unseen_weights = None
-    best_gap = float('inf')
-
-    patience = 10
-    patience_counter = 0
-    min_delta = 0.2
+        optimizer, T_0=8, T_mult=2, eta_min=1e-6)
 
     lambda_domain_init = 0.5
-    lambda_prompt = 0.08
+    lambda_prompt      = 0.08
+    patience           = 10
+    min_delta          = 0.2
+
+    best_unseen_acc     = 0.0
+    best_unseen_weights = None
+    patience_counter    = 0
+    val_acc             = 0.0
 
     for epoch in range(num_epochs):
         model.epoch = epoch
         model.train()
+        train_correct = train_total = 0
 
-        train_loss, train_correct, train_total = 0.0, 0, 0
-
-        alpha_dann = min(2.0 / (1 + np.exp(-15 * epoch / num_epochs)) - 1, 0.8)
+        alpha_dann    = min(2.0 / (1 + np.exp(-15 * epoch / num_epochs)) - 1, 0.8)
         lambda_domain = lambda_domain_init * alpha_dann
 
-        for batch in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}', leave=False):
-            time_data = batch['time_data'].to(device)
-            time_features = batch['time_features'].to(device)
-            freq_data = batch['freq_data'].to(device)
-            wavelet_data = batch['wavelet_data'].to(device)
-            labels = batch['label'].to(device)
-            domain_id = batch.get('domain', None)
-            if domain_id is not None:
-                domain_id = domain_id.to(device)
+        for batch in tqdm(train_loader,
+                          desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False):
+            time_data     = batch["time_data"].to(device)
+            time_features = batch["time_features"].to(device)
+            freq_data     = batch["freq_data"].to(device)
+            wavelet_data  = batch["wavelet_data"].to(device)
+            labels        = batch["label"].to(device)
+            domain_id     = batch["domain"].to(device)
 
             optimizer.zero_grad()
-
             outputs, dom_logits, loss_align = model(
                 time_data, time_features, freq_data, wavelet_data,
-                domain_id=domain_id, labels=labels, alpha=alpha_dann
-            )
+                domain_id=domain_id, labels=labels, alpha=alpha_dann)
 
-            class_loss = criterion(outputs, labels)
-
-            if dom_logits is not None and domain_id is not None:
-                domain_loss = F.cross_entropy(dom_logits, domain_id)
-            else:
-                domain_loss = torch.tensor(0.0, device=device)
-
+            class_loss  = criterion(outputs, labels)
+            domain_loss = (F.cross_entropy(dom_logits, domain_id)
+                           if dom_logits is not None else torch.tensor(0.0, device=device))
             loss = class_loss + lambda_domain * domain_loss + lambda_prompt * loss_align
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -123,373 +84,52 @@ def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += labels.size(0)
+            _, predicted   = outputs.max(1)
+            train_total   += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
 
         scheduler.step()
+        train_acc = 100.0 * train_correct / max(train_total, 1)
 
-        train_loss /= len(train_loader)
-        train_acc = 100. * train_correct / train_total
-
-        # 验证集评估
         model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
+        val_correct = val_total = 0
         with torch.no_grad():
             for batch in val_loader:
-                time_data = batch['time_data'].to(device)
-                time_features = batch['time_features'].to(device)
-                freq_data = batch['freq_data'].to(device)
-                wavelet_data = batch['wavelet_data'].to(device)
-                labels = batch['label'].to(device)
+                outputs, _, _ = model(
+                    batch["time_data"].to(device),
+                    batch["time_features"].to(device),
+                    batch["freq_data"].to(device),
+                    batch["wavelet_data"].to(device))
+                _, predicted  = outputs.max(1)
+                val_total    += batch["label"].size(0)
+                val_correct  += predicted.eq(batch["label"].to(device)).sum().item()
+        val_acc = 100.0 * val_correct / max(val_total, 1)
 
-                outputs, _, _ = model(time_data, time_features, freq_data, wavelet_data)
-                loss = criterion(outputs, labels)
-
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        val_loss /= len(val_loader)
-        val_acc = 100. * val_correct / val_total
-
-        # Unseen域评估
         unseen_acc = 0.0
         if unseen_loader is not None:
             unseen_acc, _, _ = evaluate_model(model, unseen_loader, device)
 
-        gap = abs(val_acc - unseen_acc)
+        print(f"Epoch {epoch + 1:02d} | "
+              f"Train: {train_acc:.2f}% | "
+              f"Val: {val_acc:.2f}% | "
+              f"Unseen: {unseen_acc:.2f}%")
 
-        print(f'Epoch {epoch + 1:02d} | Train: {train_acc:.2f}% | '
-              f'Val: {val_acc:.2f}% | Unseen: {unseen_acc:.2f}% | '
-              f'Gap: {gap:.2f}%')
-
-        # 早停策略
         if unseen_acc > best_unseen_acc + min_delta:
-            best_unseen_acc = unseen_acc
+            best_unseen_acc     = unseen_acc
             best_unseen_weights = copy.deepcopy(model.state_dict())
-            print(f" ✅ 新最佳 Unseen: {best_unseen_acc:.2f}%")
+            print(f"  ✅ 新最佳 Unseen: {best_unseen_acc:.2f}%")
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n⚠️ 早停触发(连续{patience}轮无改进)")
+                print(f"\n⚠️  早停触发 (连续 {patience} 轮无改进)")
                 break
 
     if unseen_loader is not None:
         if best_unseen_weights is not None:
-            print(f"\n✅ 训练结束，加载最佳 Unseen 模型 (Acc={best_unseen_acc:.2f}%)")
+            print(f"\n✅ 加载最佳 Unseen 模型 (Acc={best_unseen_acc:.2f}%)")
             model.load_state_dict(best_unseen_weights)
         return best_unseen_acc
-
     else:
-        print(f"\n✅ 域内任务返回验证集最终准确率 {val_acc:.2f}%")
+        print(f"\n✅ 域内任务返回验证集准确率 {val_acc:.2f}%")
         return val_acc
-
-def evaluate_model(model, test_loader, device='cuda'):
-    model.eval()
-
-    all_preds, all_labels = [], []
-
-    with torch.no_grad():
-        for batch in test_loader:
-            time_data = batch['time_data'].to(device)
-            time_features = batch['time_features'].to(device)
-            freq_data = batch['freq_data'].to(device)
-            wavelet_data = batch['wavelet_data'].to(device)
-            labels = batch['label'].to(device)
-
-            outputs, _, _ = model(time_data, time_features, freq_data, wavelet_data)
-            _, predicted = outputs.max(1)
-
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-    acc = 100. * np.sum(np.array(all_preds) == np.array(all_labels)) / len(all_labels)
-
-    return acc, all_preds, all_labels
-
-labels_csv = ['A1', 'A2', 'A3', 'Normal']
-
-def plot_confusion_matrix(y_true, y_pred, title, save_path, label_names=None):
-    if label_names is None:
-        label_names = labels_csv
-
-    cm = confusion_matrix(y_true, y_pred)
-
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        cm, annot=True, fmt='d', cmap='Blues',
-        xticklabels=label_names, yticklabels=label_names
-    )
-    plt.title(title, fontsize=12)
-    plt.ylabel('True Label', fontsize=11)
-    plt.xlabel('Predicted Label', fontsize=11)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-def extract_all_features(extractor, X):
-    print(f" 🔍 输入数据形状: {X.shape}")
-
-    time_data, time_features = extractor.extract_time_features(X)
-    freq_data = extractor.extract_freq_features(X)
-    wavelet_data = extractor.extract_wavelet_features(X)
-
-    print(f" ✅ 时域特征: {time_features.shape}")
-    print(f" ✅ 频域特征: {freq_data.shape}")
-    print(f" ✅ 小波特征: {wavelet_data.shape}")
-
-    return time_data, time_features, freq_data, wavelet_data
-# ===================== 主程序 =====================
-
-def within_domain_experiment(data_dir, sample_length=2048, batch_size=32, num_epochs=30, device='cuda'):
-
-    print("\n" + "=" * 60)
-    print("实验1:域内训练识别(每个域单独训练和测试)")
-    print("=" * 60)
-
-    loader = CSVDataLoader(data_dir=data_dir, sample_length=sample_length)
-    all_data = loader.load_all_domains()
-
-    extractor = FeatureExtractor(sample_length=sample_length)
-
-    results = {}
-
-    for domain_name, (X, y) in all_data.items():
-        print(f"\n{'=' * 60}")
-        print(f"训练域: {domain_name}")
-        print(f"{'=' * 60}")
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y)
-
-        time_train, feat_train, freq_train, wave_train = extract_all_features(extractor, X_train)
-        time_test, feat_test, freq_test, wave_test = extract_all_features(extractor, X_test)
-
-        scaler_feat = StandardScaler().fit(feat_train)
-        scaler_freq = StandardScaler().fit(freq_train)
-        scaler_wave = StandardScaler().fit(wave_train)
-
-        feat_train = scaler_feat.transform(feat_train)
-        feat_test = scaler_feat.transform(feat_test)
-
-        freq_train = scaler_freq.transform(freq_train)
-        freq_test = scaler_freq.transform(freq_test)
-
-        wave_train = scaler_wave.transform(wave_train)
-        wave_test = scaler_wave.transform(wave_test)
-
-        train_dataset = CWRUDataset(time_train, feat_train, freq_train, wave_train, y_train)
-        test_dataset = CWRUDataset(time_test, feat_test, freq_test, wave_test, y_test)
-
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-        model = MultiModalMLPTransformer(
-            num_classes=4,
-            num_domains=4,
-            dim_time=feat_train.shape[1],
-            dim_freq=freq_train.shape[1],
-            dim_env=wave_train.shape[1]
-        ).to(device)
-
-        best_acc = train_model(model, train_loader, test_loader, num_epochs=num_epochs, device=device)
-
-        test_acc, y_pred, y_true = evaluate_model(model, test_loader, device)
-
-        print(f"\n✅ {domain_name} 最终测试准确率: {test_acc:.2f}%")
-
-        print("\n分类报告:")
-        print(classification_report(y_true, y_pred, target_names=labels_csv, zero_division=0))
-
-        plot_confusion_matrix(y_true, y_pred, f'Confusion Matrix - {domain_name}',
-                              f'cm_within_{domain_name}.png', label_names=labels_csv)
-
-        results[domain_name] = test_acc
-
-    print(f"\n{'=' * 60}")
-    print("域内实验总结:")
-    for domain, acc in results.items():
-        print(f" {domain}: {acc:.2f}%")
-    print(f" 平均准确率: {np.mean(list(results.values())):.2f}%")
-    print(f"{'=' * 60}")
-
-    return results
-
-def cross_domain_experiment(data_dir, sample_length=2048, batch_size=32, num_epochs=40, device='cuda'):
-
-    print("\n" + "=" * 60)
-    print("实验2:跨域识别(留一域测试)")
-    print("=" * 60)
-
-    loader = CSVDataLoader(data_dir=data_dir, sample_length=sample_length)
-    all_domains = loader.domains
-
-    extractor = FeatureExtractor(sample_length=sample_length)
-
-    results = {}
-
-    for test_domain in all_domains:
-        print(f"\n{'=' * 60}")
-        print(f"测试域: {test_domain}")
-        print(f"{'=' * 60}")
-
-        X_train, y_train, domain_train, X_test, y_test = loader.load_cross_domain_data(test_domain)
-
-        if X_train is None or X_test is None:
-            print(f"⚠️ 域 {test_domain} 数据不足,跳过")
-            continue
-
-        time_train, feat_train, freq_train, wave_train = extract_all_features(extractor, X_train)
-        time_test, feat_test, freq_test, wave_test = extract_all_features(extractor, X_test)
-
-        scaler_feat = StandardScaler().fit(feat_train)
-        scaler_freq = StandardScaler().fit(freq_train)
-        scaler_wave = StandardScaler().fit(wave_train)
-
-        feat_train = scaler_feat.transform(feat_train)
-        feat_test = scaler_feat.transform(feat_test)
-
-        freq_train = scaler_freq.transform(freq_train)
-        freq_test = scaler_freq.transform(freq_test)
-
-        wave_train = scaler_wave.transform(wave_train)
-        wave_test = scaler_wave.transform(wave_test)
-
-        train_data = []
-        for i in range(len(y_train)):
-            feat_dict = {
-                "time": time_train[i].tolist(),
-                "freq": freq_train[i].tolist(),
-                "wave": wave_train[i].tolist(),
-                "feat": feat_train[i].tolist()
-            }
-            train_data.append({
-                "y": int(y_train[i]),
-                "domain": int(domain_train[i]),
-                "feat": feat_dict
-            })
-
-        pseudo_samples = generate_pseudo_domain_samples(
-            train_data, n_mix_per_class=80, alpha=0.6
-        )
-
-        if len(pseudo_samples) > 0:
-            pseudo_time = np.array([s["feat"]["time"] for s in pseudo_samples])
-            pseudo_freq = np.array([s["feat"]["freq"] for s in pseudo_samples])
-            pseudo_wave = np.array([s["feat"]["wave"] for s in pseudo_samples])
-            pseudo_feat = np.array([s["feat"]["feat"] for s in pseudo_samples])
-            pseudo_y = np.array([s["y"] for s in pseudo_samples])
-            pseudo_domain = np.array([s["domain"] for s in pseudo_samples])
-
-            time_train = np.concatenate([time_train, pseudo_time], axis=0)
-            freq_train = np.concatenate([freq_train, pseudo_freq], axis=0)
-            wave_train = np.concatenate([wave_train, pseudo_wave], axis=0)
-            feat_train = np.concatenate([feat_train, pseudo_feat], axis=0)
-            y_train = np.concatenate([y_train, pseudo_y], axis=0)
-            domain_train = np.concatenate([domain_train, pseudo_domain], axis=0)
-
-            print(f" 📊 增强后训练集: {len(y_train)}样本, 标签分布: {np.bincount(y_train)}")
-
-        num_domains = 4
-        domain_test = np.full(len(y_test), 1)
-
-        train_dataset = CWRUDataset(time_train, feat_train, freq_train, wave_train, y_train, domain_train)
-        test_dataset = CWRUDataset(time_test, feat_test, freq_test, wave_test, y_test, domain_test)
-
-        train_size = int(0.85 * len(train_dataset))
-        val_size = len(train_dataset) - train_size
-
-        train_subset, val_subset = torch.utils.data.random_split(
-            train_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-
-        train_loader = DataLoader(
-            train_subset, batch_size=batch_size, shuffle=True,
-            worker_init_fn=lambda worker_id: np.random.seed(42 + worker_id)
-        )
-        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-        model = MultiModalMLPTransformer(
-            num_classes=4,
-            num_domains=num_domains,
-            dim_time=feat_train.shape[1],
-            dim_freq=freq_train.shape[1],
-            dim_env=wave_train.shape[1],
-            use_dann=True
-        ).to(device)
-
-        best_acc = train_model(
-            model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            unseen_loader=test_loader,
-            num_epochs=num_epochs,
-            device=device
-        )
-
-        test_acc, y_pred, y_true = evaluate_model(model, test_loader, device)
-
-
-        print(f"\n✅ 跨域测试 ({test_domain}) 准确率: {test_acc:.2f}%")
-
-        print("\n分类报告:")
-        print(classification_report(y_true, y_pred, target_names=labels_csv, zero_division=0))
-
-        plot_confusion_matrix(
-            y_true, y_pred,
-            f'Confusion Matrix - Cross Domain Test on {test_domain}',
-            f'cm_cross_{test_domain}.png',
-            label_names=labels_csv
-        )
-
-        results[test_domain] = test_acc
-
-    print(f"\n{'=' * 60}")
-    print("跨域实验总结:")
-    for domain, acc in results.items():
-        print(f" 测试域 {domain}: {acc:.2f}%")
-    print(f" 平均准确率: {np.mean(list(results.values())):.2f}%")
-    print(f"{'=' * 60}")
-
-    return results
-
-def main():
-    """主函数"""
-    SEED = 42
-    set_seed(SEED)
-
-    DATA_DIR = 'F:/datasets/Experiment_Data2/Current_signal/merged/out/datasets/A_4class/1500'
-    SAMPLE_LENGTH = 2048
-    BATCH_SIZE = 32
-    NUM_EPOCHS = 30
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    print(f"使用设备: {DEVICE}")
-    print(f"数据目录: {DATA_DIR}")
-
-    print("\n请选择实验模式:")
-    print("1 - 域内训练识别(每个域单独训练测试)")
-    print("2 - 跨域识别(留一域测试)")
-    print("3 - 两种实验都运行")
-
-    mode = input("请输入选择 (1/2/3): ").strip()
-
-    if mode == '1':
-        within_domain_experiment(DATA_DIR, SAMPLE_LENGTH, BATCH_SIZE, NUM_EPOCHS, DEVICE)
-    elif mode == '2':
-        cross_domain_experiment(DATA_DIR, SAMPLE_LENGTH, BATCH_SIZE, NUM_EPOCHS, DEVICE)
-    elif mode == '3':
-        within_domain_experiment(DATA_DIR, SAMPLE_LENGTH, BATCH_SIZE, NUM_EPOCHS, DEVICE)
-        cross_domain_experiment(DATA_DIR, SAMPLE_LENGTH, BATCH_SIZE, NUM_EPOCHS, DEVICE)
-    else:
-        print("无效的选择!")
-
-
-if __name__ == '__main__':
-    main()
