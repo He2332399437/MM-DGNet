@@ -10,7 +10,7 @@ To ensure the project runs smoothly, please make sure the required Python librar
 
 File Descriptions
 
-dataset.py
+dataset:
 Data processing file. This code implements a complete data processing pipeline for three-channel CSV-format mechanical equipment vibration data, including:
 
 Loading data from raw CSV files
@@ -22,9 +22,6 @@ Feature extraction
 Dataset splitting (training set, validation set, test set)
 
 This file is the core of data processing, ensuring that the data is processed in a format suitable for model training.
-
-CEPM.py
-This file implements Cross-Condition Evolution Prior Modeling (CEPM), which dynamically generates evolution samples. It solves the problem of insufficient samples for certain categories and single domain distribution by generating synthetic data for each category, enhancing the diversity of the training set and improving the model's generalization capability.
 
 model.py
 Model parameter file. This file defines the model architecture and uses a lightweight attention mechanism (such as a simplified Transformer structure). By reducing the model depth and embedding dimensions, it ensures a balance between computational efficiency and performance, allowing the model to respond quickly in real-time applications.
