@@ -139,12 +139,12 @@ def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=
         if unseen_acc > best_unseen_acc + min_delta:
             best_unseen_acc = unseen_acc
             best_unseen_weights = copy.deepcopy(model.state_dict())
-            print(f" ✅ 新最佳 Unseen: {best_unseen_acc:.2f}%")
+            print(f" ✅ New Unseen: {best_unseen_acc:.2f}%")
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n⚠️ 早停触发(连续{patience}轮无改进)")
+                print(f"\n⚠️ stop({patience})")
                 break
 
     if unseen_loader is not None:
