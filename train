@@ -9,7 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=40, device='cuda'):
+def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=30, device='cuda'):
 
     class_counts = torch.zeros(4)
     for batch in train_loader:
