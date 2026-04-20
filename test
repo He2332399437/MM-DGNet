@@ -72,7 +72,7 @@ class FeatureExtractor:
 
 
 def extract_all_features(extractor, X):
-    print(f" 🔍 输入数据形状: {X.shape}")
+    print(f" 🔍 shape: {X.shape}")
 
     time_data, time_features = extractor.extract_time_features(X)
     freq_data = extractor.extract_freq_features(X)
