@@ -126,37 +126,9 @@ def train_model(model, train_loader, val_loader, unseen_loader=None, num_epochs=
         val_loss /= len(val_loader)
         val_acc = 100. * val_correct / val_total
 
-        unseen_acc = 0.0
-        if unseen_loader is not None:
-            unseen_acc, _, _ = evaluate_model(model, unseen_loader, device)
-
-        gap = abs(val_acc - unseen_acc)
-
         print(f'Epoch {epoch + 1:02d} | Train: {train_acc:.2f}% | '
-              f'Val: {val_acc:.2f}% '
-              f'Gap: {gap:.2f}%')
-
-        if unseen_acc > best_unseen_acc + min_delta:
-            best_unseen_acc = unseen_acc
-            best_unseen_weights = copy.deepcopy(model.state_dict())
-            print(f" ✅ New Unseen: {best_unseen_acc:.2f}%")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\n⚠️ stop({patience})")
-                break
-
-    if unseen_loader is not None:
-        if best_unseen_weights is not None:
-            print(f"\n✅ best Unseen  (Acc={best_unseen_acc:.2f}%)")
-            model.load_state_dict(best_unseen_weights)
-        return best_unseen_acc
-
-    else:
-        print(f"\n✅ ACC {val_acc:.2f}%")
-        return val_acc
-
+              f'Val: {val_acc:.2f}%')
+      
 
 def evaluate_model(model, test_loader, device='cuda'):
     model.eval()
