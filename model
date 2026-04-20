@@ -4,52 +4,10 @@ import torch.nn.functional as F
 import warnings
 warnings.filterwarnings('ignore')
 
-class AdaptiveDomainPrompt_KG(nn.Module):
-    def __init__(self, num_domains, prompt_dim=128, hidden_dim=256,
-                 dropout=0.5, alpha_align=0.05):
-        super().__init__()
-        self.num_domains = num_domains
-        self.alpha_align = alpha_align 
-        self.prompt_dim = prompt_dim
-        self.domain_embed = nn.Parameter(torch.randn(num_domains, prompt_dim) * 0.01)
-        nn.init.orthogonal_(self.domain_embed)
-        self.domain_proj = nn.Sequential(
-            nn.Linear(1, prompt_dim),
-            nn.LayerNorm(prompt_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        self.feat_adapter = nn.Sequential(
-            nn.Linear(prompt_dim, prompt_dim),
-            nn.LayerNorm(prompt_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+class AdaptiveDomainPrompt_CEPM(nn.Module):
 
-        self.norm = nn.LayerNorm(prompt_dim)
+   Sorry, this section is still being updated.
 
-    def forward(self, domain_ids, feat_mean=None, return_loss=False):
-        dom_norm = domain_ids.float().unsqueeze(1) / (self.num_domains - 1)
-        safe_ids = domain_ids.clamp(max=self.num_domains - 1)
-
-        base_prompt = self.domain_embed[safe_ids]
-        cont_prompt = self.domain_proj(dom_norm)
-
-        if feat_mean is not None:
-            adapt_prompt = self.feat_adapter(feat_mean)
-            prompt = base_prompt + cont_prompt + adapt_prompt
-        else:
-            prompt = base_prompt + cont_prompt
-
-        prompt = self.norm(prompt)
-
-        loss_total = torch.tensor(0.0, device=prompt.device)
-        if return_loss and self.training:
-            global_center = self.domain_embed.mean(0, keepdim=True)
-            loss_align = self.alpha_align * ((self.domain_embed - global_center) ** 2).mean()
-            loss_total = loss_align
-
-        return (prompt, loss_total) if return_loss else prompt
 
 
 class ResidualMLPBlock(nn.Module):
